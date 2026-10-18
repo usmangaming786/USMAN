@@ -3,7 +3,7 @@
 # ============================================================
 
 # Telegram Bot Token (from @BotFather)
-BOT_TOKEN = "8906964118:AAGrUh3Yd7gA2dTLnezwS2lV97AxWBs2h9A"
+BOT_TOKEN = "8839862831:AAEE3_PovoInHububju3_SpnBf8PQNFbTSk"
 # No default Firebase — each user adds their own via the bot
 
 # Default delay in seconds between SMS dispatches per device
