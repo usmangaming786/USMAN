@@ -6,6 +6,9 @@ import io
 import json
 import math
 import time
+import concurrent.futures
+import threading
+import functools
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -21,6 +24,10 @@ from telegram.ext import (
 import config
 from firebase_manager import FirebaseManager
 from database import Database
+
+# High-concurrency thread pool — handles many simultaneous Firebase calls
+# (one per device × poll/send/clear) without starving the event loop
+_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=128, thread_name_prefix="fb")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1421,21 +1428,26 @@ async def run_campaign(campaign_id: str, message, user_id: int):
     progress = {'completed': 0, 'failed': 0, 'total': total, 'active_workers': len(device_ids)}
     dev_stats = {did: {'sent': 0, 'failed': 0, 'speed_sum': 0.0} for did in device_ids}
 
-    # ── Smart isSended poller ──────────────────────────────
-    async def _wait_for_sent(fb: FirebaseManager, dev_id: str, timeout: float = 12) -> bool:
-        """Poll isSended every 0.8s. Return True if confirmed, False on timeout."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if camp.get('stop'):
-                return False
-            try:
-                status = await asyncio.to_thread(fb.get_sms_status, dev_id)
-                if status and status.get('isSended') in (True, 'true', 1, '1'):
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.3)
-        return False
+    # ── SSE-based instant isSended detector ───────────────
+    # One stop_flag per campaign — set when camp['stop'] fires
+    _stop_flag = threading.Event()
+
+    async def _wait_for_sent(fb: FirebaseManager, dev_id: str, timeout: float = 10) -> bool:
+        """
+        Block in a thread using Firebase SSE — returns the INSTANT
+        isSended becomes true, with zero polling lag.
+        Falls back to a single HTTP poll if the stream drops.
+        """
+        if camp.get('stop'):
+            return False
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _THREAD_POOL,
+            fb.wait_for_sent_sse,
+            dev_id,
+            timeout,
+            _stop_flag,
+        )
 
     # ── Per-device worker ──────────────────────────────────
     async def device_worker(dev_id: str, targets: list):
@@ -1450,7 +1462,7 @@ async def run_campaign(campaign_id: str, message, user_id: int):
 
         fb = FirebaseManager(dev_fb_url)
 
-        for target in targets:
+        for idx, target in enumerate(targets):
             if camp.get('stop'):
                 break
 
@@ -1462,48 +1474,80 @@ async def run_campaign(campaign_id: str, message, user_id: int):
                 break
 
             sms_start = time.time()
+            loop = asyncio.get_event_loop()
 
-            # 1. Mark ASSIGNED
-            db.update_target_status(campaign_id, target['target_id'], 'ASSIGNED', dev_id)
-
-            # 2. Write sendSms command (run in thread to avoid blocking event loop)
-            success = await asyncio.to_thread(
-                fb.send_sms_command, dev_id, target['mobile'], target['message'], sim_slot
-            )
-
-            if not success:
-                await asyncio.sleep(0.4)
-                success = await asyncio.to_thread(
-                    fb.send_sms_command, dev_id, target['mobile'], target['message'], sim_slot
+            def _db(status: str, error: str = ''):
+                """Helper — runs DB write in thread pool, non-blocking."""
+                return loop.run_in_executor(
+                    _THREAD_POOL,
+                    functools.partial(
+                        db.update_target_status,
+                        campaign_id, target['target_id'], status, dev_id, error
+                    )
                 )
 
-            if not success:
-                db.update_target_status(campaign_id, target['target_id'], 'FAILED', dev_id, 'dispatch_error')
+            # 1. Mark ASSIGNED
+            _db('ASSIGNED')
+
+            # ── 2. Write sendSms to Firebase (up to 2 attempts) ──────
+            async def _try_send() -> bool:
+                ok = await loop.run_in_executor(
+                    _THREAD_POOL,
+                    functools.partial(
+                        fb.send_sms_command,
+                        dev_id, target['mobile'], target['message'], sim_slot
+                    )
+                )
+                return ok
+
+            write_ok = await _try_send()
+            if not write_ok:
+                await asyncio.sleep(0.3)
+                write_ok = await _try_send()
+
+            if not write_ok:
+                # Firebase write itself failed — mark FAILED immediately
+                _db('FAILED', 'firebase_write_error')
                 progress['failed'] += 1
                 dev_stats[dev_id]['failed'] += 1
                 continue
 
-            # 3. Smart wait — poll isSended, move on ASAP when confirmed
+            # ── 3. Wait for device to confirm (SSE instant or fallback poll)
             confirmed = await _wait_for_sent(fb, dev_id, timeout=10)
 
-            # Clear the SMS node so device is immediately ready for next command
-            asyncio.create_task(asyncio.to_thread(fb.clear_sms_command, dev_id))
+            if not confirmed:
+                # ── 3a. One retry — clear stuck node, re-write, wait again ──
+                # (device may have been briefly busy / reconnecting)
+                await loop.run_in_executor(_THREAD_POOL, fb.clear_sms_command, dev_id)
+                await asyncio.sleep(0.5)
 
-            if confirmed:
-                db.update_target_status(campaign_id, target['target_id'], 'COMPLETED', dev_id)
-                progress['completed'] += 1
-                dev_stats[dev_id]['sent'] += 1
-            else:
-                # Timeout but command was written — mark completed (device will process)
-                db.update_target_status(campaign_id, target['target_id'], 'COMPLETED', dev_id)
-                progress['completed'] += 1
-                dev_stats[dev_id]['sent'] += 1
+                write_ok2 = await _try_send()
+                if write_ok2:
+                    confirmed = await _wait_for_sent(fb, dev_id, timeout=10)
 
             sms_time = time.time() - sms_start
             dev_stats[dev_id]['speed_sum'] += sms_time
 
-            # 4. Extra delay if user configured more than adaptive wait
-            extra_wait = max(0, delay - sms_time)
+            if confirmed:
+                # ── Real confirmed send ─────────────────────────────────
+                _db('COMPLETED')
+                progress['completed'] += 1
+                dev_stats[dev_id]['sent'] += 1
+
+                # Clear node only on last target (saves one round-trip per SMS)
+                if idx == len(targets) - 1:
+                    loop.run_in_executor(_THREAD_POOL, fb.clear_sms_command, dev_id)
+
+            else:
+                # ── Both attempts timed out — real failure, not fake success ─
+                # Clear the stuck node so device isn't blocked for next campaign
+                loop.run_in_executor(_THREAD_POOL, fb.clear_sms_command, dev_id)
+                _db('FAILED', 'sms_timeout')
+                progress['failed'] += 1
+                dev_stats[dev_id]['failed'] += 1
+
+            # ── 4. Extra delay only if configured delay > actual send time ──
+            extra_wait = max(0.0, delay - sms_time)
             if extra_wait > 0:
                 await asyncio.sleep(extra_wait)
 
@@ -1571,8 +1615,11 @@ async def run_campaign(campaign_id: str, message, user_id: int):
     if worker_tasks:
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
+    # Signal all SSE threads to abort if still running
+    _stop_flag.set()
+
     # Stop monitor
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     monitor_task.cancel()
     try:
         await monitor_task
